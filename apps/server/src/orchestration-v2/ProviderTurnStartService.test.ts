@@ -2,6 +2,7 @@ import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
 import {
   CheckpointScopeId,
+  GitCommandError,
   MessageId,
   NodeId,
   ProviderSessionId,
@@ -22,6 +23,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
@@ -95,7 +97,16 @@ it("does not commit running state when inherited background routing cannot be re
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
-        Layer.succeed(FileSystem.FileSystem, { exists: () => Effect.succeed(false) } as never),
+        FileSystem.layerNoop({
+          stat: () =>
+            Effect.fail(
+              PlatformError.systemError({
+                _tag: "NotFound",
+                module: "FileSystem",
+                method: "stat",
+              }),
+            ),
+        }),
         Layer.mock(GitWorkflow.GitWorkflowService)({ pruneWorktrees, createWorktree }),
         Layer.mock(ProjectService.ProjectService)({
           getById: () =>
@@ -171,6 +182,12 @@ function makeLocalCommandHarness(input: {
   readonly writeFailure?: unknown;
   /** Loads the thread and starts the run, then fails every later state read. */
   readonly failReadsAfterRunning?: boolean;
+  readonly worktree?: {
+    readonly branch: string | null;
+    readonly type: "missing" | "Directory" | "File";
+    readonly repair: "success" | "failure" | "interrupted";
+    readonly projectMissing?: boolean;
+  };
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
   const threadId = ThreadId.make("thread-native-account-command");
@@ -235,9 +252,10 @@ function makeLocalCommandHarness(input: {
   let projection: OrchestrationV2ThreadProjection = {
     thread: {
       id: threadId,
+      projectId: ProjectId.make("project-native-account-command"),
       activeProviderThreadId: providerThreadId,
-      branch: null,
-      worktreePath: null,
+      branch: input.worktree?.branch ?? null,
+      worktreePath: input.worktree ? "/tmp/native-account-command-worktree" : null,
     } as OrchestrationV2ThreadProjection["thread"],
     runs: [
       ...(input.previousNativeSession
@@ -356,6 +374,21 @@ function makeLocalCommandHarness(input: {
     };
   }
   const events: Array<OrchestrationV2DomainEvent> = [];
+  const pruneWorktrees = vi.fn(() => Effect.void);
+  const createWorktree = vi.fn(() =>
+    input.worktree?.repair === "interrupted"
+      ? Effect.interrupt
+      : input.worktree?.repair === "failure"
+        ? Effect.fail(
+            new GitCommandError({
+              operation: "GitVcsDriver.createWorktree",
+              command: "git worktree add",
+              cwd: "/tmp/native-account-command",
+              detail: "invalid reference: feature/deleted",
+            }),
+          )
+        : Effect.succeed({} as never),
+  );
   const interruptRun = () => {
     projection = {
       ...projection,
@@ -491,9 +524,29 @@ function makeLocalCommandHarness(input: {
         }),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
-        FileSystem.layerNoop({}),
-        Layer.mock(GitWorkflow.GitWorkflowService)({}),
-        Layer.mock(ProjectService.ProjectService)({}),
+        FileSystem.layerNoop({
+          stat: () =>
+            input.worktree?.type === "missing"
+              ? Effect.fail(
+                  PlatformError.systemError({
+                    _tag: "NotFound",
+                    module: "FileSystem",
+                    method: "stat",
+                  }),
+                )
+              : Effect.succeed({
+                  type: input.worktree?.type ?? "Directory",
+                } as FileSystem.File.Info),
+        }),
+        Layer.mock(GitWorkflow.GitWorkflowService)({ pruneWorktrees, createWorktree }),
+        Layer.mock(ProjectService.ProjectService)({
+          getById: () =>
+            Effect.succeed(
+              input.worktree?.projectMissing
+                ? Option.none()
+                : Option.some({ workspaceRoot: "/tmp/native-account-command" } as never),
+            ),
+        }),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
           getTurnStartContext: () =>
             Effect.succeed({
@@ -531,6 +584,8 @@ function makeLocalCommandHarness(input: {
     ),
   );
   return {
+    pruneWorktrees,
+    createWorktree,
     open,
     writeIfRunCurrent,
     startRootRun,
@@ -552,6 +607,99 @@ function makeLocalCommandHarness(input: {
     }).pipe(Effect.provide(layer)),
   };
 }
+
+effectIt.effect.each([
+  { branch: "feature/deleted", type: "missing" as const, projectMissing: false },
+  { branch: "feature/deleted", type: "File" as const, projectMissing: false },
+  { branch: null, type: "missing" as const, projectMissing: false },
+  { branch: "feature/deleted", type: "missing" as const, projectMissing: true },
+])("fails before provider startup when the worktree cannot be restored: %j", (worktree) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      worktree: { ...worktree, repair: "failure" },
+    });
+    yield* harness.startWithRetry;
+    const projection = harness.projection();
+    expect(projection.runs.at(-1)).toMatchObject({ status: "failed", startedAt: null });
+    expect(projection.attempts[0]).toMatchObject({ status: "failed", startedAt: null });
+    expect(projection.nodes[0]).toMatchObject({ status: "failed", startedAt: null });
+    expect(projection.turnItems).toMatchObject([
+      {
+        type: "error",
+        title: "Thread workspace unavailable",
+        status: "failed",
+        failure: {
+          class: "validation_error",
+          message:
+            "This thread's worktree no longer exists or is not a directory at /tmp/native-account-command-worktree, and T3 could not restore it. Restore that worktree or select another branch for this thread, then retry.",
+        },
+      },
+    ]);
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    if (worktree.branch === null || worktree.projectMissing) {
+      expect(harness.createWorktree).not.toHaveBeenCalled();
+    }
+  }),
+);
+
+effectIt.effect.each(["missing", "Directory"] as const)(
+  "starts the provider when the worktree is available after recovery: %s",
+  (type) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        failReadsAfterRunning: true,
+        worktree: { branch: "feature/restore", type, repair: "success" },
+      });
+      yield* harness.start;
+      expect(harness.open).toHaveBeenCalledOnce();
+      expect(harness.startRootRun).toHaveBeenCalledOnce();
+      expect(harness.projection().runs.at(-1)?.status).toBe("running");
+      if (type === "missing") {
+        expect(harness.pruneWorktrees).toHaveBeenCalledWith({ cwd: "/tmp/native-account-command" });
+        expect(harness.createWorktree).toHaveBeenCalledWith({
+          cwd: "/tmp/native-account-command",
+          refName: "feature/restore",
+          path: "/tmp/native-account-command-worktree",
+        });
+      } else {
+        expect(harness.pruneWorktrees).not.toHaveBeenCalled();
+        expect(harness.createWorktree).not.toHaveBeenCalled();
+      }
+    }),
+);
+
+effectIt.effect("does not terminalize an interrupted worktree repair", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      worktree: { branch: "feature/restore", type: "missing", repair: "interrupted" },
+    });
+    const exit = yield* Effect.exit(harness.start);
+    expect(exit._tag).toBe("Failure");
+    if (exit._tag === "Failure") expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true);
+    expect(harness.projection().runs.at(-1)?.status).toBe("starting");
+    expect(harness.events).toEqual([]);
+    expect(harness.open).not.toHaveBeenCalled();
+  }),
+);
+
+effectIt.effect("keeps a failed worktree repair retryable when persistence fails", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      writeFailure: new Error("database unavailable"),
+      worktree: { branch: "feature/deleted", type: "missing", repair: "failure" },
+    });
+    const error = yield* harness.start.pipe(Effect.flip);
+    expect(error._tag).toBe("ProviderTurnStartError");
+    expect(harness.projection().runs.at(-1)?.status).toBe("starting");
+    expect(harness.events).toEqual([]);
+    expect(harness.open).not.toHaveBeenCalled();
+  }),
+);
 
 effectIt.effect("terminalizes a starting run when its provider session cannot open", () =>
   Effect.gen(function* () {

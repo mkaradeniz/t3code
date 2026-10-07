@@ -462,39 +462,62 @@ export const layer: Layer.Layer<
         }
       }
       const { worktreePath, branch } = projection.thread;
-      if (worktreePath !== null && branch !== null) {
-        const exists = yield* fileSystem
-          .exists(worktreePath)
-          .pipe(Effect.orElseSucceed(() => true));
-        if (!exists) {
+      if (worktreePath !== null) {
+        const isDirectory = yield* fileSystem.stat(worktreePath).pipe(
+          Effect.map((stat) => stat.type === "Directory"),
+          Effect.catch((error) => Effect.succeed(error.reason._tag !== "NotFound")),
+        );
+        if (!isDirectory) {
           const project = yield* projects.getById(projection.thread.projectId).pipe(
             Effect.map(Option.getOrUndefined),
             Effect.orElseSucceed(() => undefined),
           );
-          if (project !== undefined) {
-            yield* Effect.logWarning("provider turn start recreating missing worktree", {
-              threadId: projection.thread.id,
-              worktreePath,
-              branch,
-            });
-            yield* gitWorkflow.pruneWorktrees({ cwd: project.workspaceRoot }).pipe(
-              Effect.andThen(
-                gitWorkflow.createWorktree({
-                  cwd: project.workspaceRoot,
-                  refName: branch,
-                  path: worktreePath,
+          const repaired =
+            project !== undefined && branch !== null
+              ? yield* Effect.gen(function* () {
+                  yield* Effect.logWarning("provider turn start recreating missing worktree", {
+                    threadId: projection.thread.id,
+                    worktreePath,
+                    branch,
+                  });
+                  return yield* gitWorkflow.pruneWorktrees({ cwd: project.workspaceRoot }).pipe(
+                    Effect.andThen(
+                      gitWorkflow.createWorktree({
+                        cwd: project.workspaceRoot,
+                        refName: branch,
+                        path: worktreePath,
+                      }),
+                    ),
+                    Effect.as(true),
+                    Effect.catchCause((cause) =>
+                      Cause.hasInterruptsOnly(cause)
+                        ? Effect.failCause(cause)
+                        : Effect.logWarning("provider turn start failed to recreate worktree", {
+                            threadId: projection.thread.id,
+                            worktreePath,
+                            cause: Cause.pretty(cause),
+                          }).pipe(Effect.as(false)),
+                    ),
+                  );
+                })
+              : false;
+          if (!repaired) {
+            yield* settleRunBeforeStart({
+              signal: "worktree-recovery-failure",
+              status: "failed",
+              now: yield* DateTime.now,
+              providerInstanceId: run.providerInstanceId,
+              itemProviderThreadId: providerThread.id,
+              item: {
+                type: "error",
+                title: "Thread workspace unavailable",
+                failure: makeProviderFailure({
+                  class: "validation_error",
+                  message: `This thread's worktree no longer exists or is not a directory at ${worktreePath}, and T3 could not restore it. Restore that worktree or select another branch for this thread, then retry.`,
                 }),
-              ),
-              Effect.catchCause((cause) =>
-                Cause.hasInterruptsOnly(cause)
-                  ? Effect.failCause(cause)
-                  : Effect.logWarning("provider turn start failed to recreate worktree", {
-                      threadId: projection.thread.id,
-                      worktreePath,
-                      cause: Cause.pretty(cause),
-                    }),
-              ),
-            );
+              },
+            });
+            return;
           }
         }
       }

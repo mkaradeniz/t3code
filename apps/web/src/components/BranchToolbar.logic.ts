@@ -67,6 +67,7 @@ export function shouldShowEnvironmentIndicator(input: {
 export function shouldShowComposerContextStrip(input: {
   isDraftHeroState: boolean;
   persistInActiveThreads: boolean;
+  needsWorkspaceRecovery?: boolean;
   hasActiveProject: boolean;
   isGitRepo: boolean;
   showEnvironmentIndicator: boolean;
@@ -75,9 +76,32 @@ export function shouldShowComposerContextStrip(input: {
 }): boolean {
   return (
     input.hasActiveProject &&
-    (input.isDraftHeroState || input.persistInActiveThreads) &&
+    (input.isDraftHeroState ||
+      input.persistInActiveThreads ||
+      input.needsWorkspaceRecovery === true) &&
     (input.isGitRepo || input.showEnvironmentIndicator || input.hostsRestingComposerControls)
   );
+}
+
+export function shouldShowGitControls(input: {
+  activeWorkspaceIsGitRepo: boolean;
+  hasActiveWorktree: boolean;
+  projectCheckoutIsGitRepo: boolean | null;
+}): boolean {
+  return (
+    input.activeWorkspaceIsGitRepo ||
+    (input.hasActiveWorktree && input.projectCheckoutIsGitRepo === true)
+  );
+}
+
+export function resolveBranchWorkspaceCwd(input: {
+  activeProjectCwd: string | null;
+  activeWorktreePath: string | null;
+  activeWorktreeIsRepo: boolean | null;
+}): string | null {
+  return input.activeWorktreePath !== null && input.activeWorktreeIsRepo !== false
+    ? input.activeWorktreePath
+    : input.activeProjectCwd;
 }
 
 // Labels collapse to icons when the strip's content no longer fits. A small

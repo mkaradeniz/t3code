@@ -10,6 +10,7 @@ import {
   resolveEffectiveEnvMode,
   resolveEnvModeLabel,
   resolveBranchTriggerLabel,
+  resolveBranchWorkspaceCwd,
   resolveBranchToolbarPrBranch,
   resolveBranchToolbarValue,
   resolveLockedWorkspaceLabel,
@@ -20,6 +21,7 @@ import {
   shouldIncludeBranchPickerItem,
   shouldShowComposerContextStrip,
   shouldShowEnvironmentIndicator,
+  shouldShowGitControls,
 } from "./BranchToolbar.logic";
 
 const localEnvironmentId = EnvironmentId.make("environment-local");
@@ -424,6 +426,19 @@ describe("shouldShowEnvironmentIndicator", () => {
 });
 
 describe("shouldShowComposerContextStrip", () => {
+  it("exposes workspace recovery even when context is hidden for active threads", () => {
+    expect(
+      shouldShowComposerContextStrip({
+        isDraftHeroState: false,
+        persistInActiveThreads: false,
+        needsWorkspaceRecovery: true,
+        hasActiveProject: true,
+        isGitRepo: true,
+        showEnvironmentIndicator: false,
+        hostsRestingComposerControls: false,
+      }),
+    ).toBe(true);
+  });
   it.each([false, true])(
     "honors the active-thread preference with resting controls %s",
     (hostsRestingComposerControls) => {
@@ -491,6 +506,68 @@ describe("shouldShowComposerContextStrip", () => {
         hostsRestingComposerControls: false,
       }),
     ).toBe(true);
+  });
+});
+
+describe("missing worktree recovery", () => {
+  it.each([true, false, null])(
+    "uses project Git status for recovery controls: %s",
+    (projectCheckoutIsGitRepo) => {
+      expect(
+        shouldShowGitControls({
+          activeWorkspaceIsGitRepo: false,
+          hasActiveWorktree: true,
+          projectCheckoutIsGitRepo,
+        }),
+      ).toBe(projectCheckoutIsGitRepo === true);
+    },
+  );
+
+  it("keeps controls for a healthy checkout", () => {
+    expect(
+      shouldShowGitControls({
+        activeWorkspaceIsGitRepo: true,
+        hasActiveWorktree: false,
+        projectCheckoutIsGitRepo: null,
+      }),
+    ).toBe(true);
+  });
+
+  it.each([true, null])(
+    "keeps the worktree until its status confirms it is unavailable: %s",
+    (activeWorktreeIsRepo) => {
+      expect(
+        resolveBranchWorkspaceCwd({
+          activeProjectCwd: "/repo",
+          activeWorktreePath: "/deleted",
+          activeWorktreeIsRepo,
+        }),
+      ).toBe("/deleted");
+    },
+  );
+
+  it.each([
+    { isDefault: true, worktreePath: "/repo" },
+    { isDefault: false, worktreePath: null },
+    { isDefault: false, worktreePath: "/other-worktree" },
+  ])("rebinds away from the unavailable worktree: %j", (refName) => {
+    const branchCwd = resolveBranchWorkspaceCwd({
+      activeProjectCwd: "/repo",
+      activeWorktreePath: "/deleted",
+      activeWorktreeIsRepo: false,
+    });
+    expect(branchCwd).toBe("/repo");
+    expect(
+      resolveBranchSelectionTarget({
+        activeProjectCwd: "/repo",
+        activeWorktreePath: branchCwd === "/deleted" ? "/deleted" : null,
+        refName,
+      }),
+    ).toEqual({
+      checkoutCwd: refName.worktreePath ?? "/repo",
+      nextWorktreePath: refName.worktreePath === "/other-worktree" ? "/other-worktree" : null,
+      reuseExistingWorktree: refName.worktreePath !== null,
+    });
   });
 });
 
