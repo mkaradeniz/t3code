@@ -187,6 +187,7 @@ function makeLocalCommandHarness(input: {
     readonly type: "missing" | "Directory" | "File";
     readonly repair: "success" | "failure" | "interrupted";
     readonly projectMissing?: boolean;
+    readonly statFailure?: PlatformError.PlatformError;
   };
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
@@ -526,17 +527,19 @@ function makeLocalCommandHarness(input: {
         IdAllocator.layer,
         FileSystem.layerNoop({
           stat: () =>
-            input.worktree?.type === "missing"
-              ? Effect.fail(
-                  PlatformError.systemError({
-                    _tag: "NotFound",
-                    module: "FileSystem",
-                    method: "stat",
-                  }),
-                )
-              : Effect.succeed({
-                  type: input.worktree?.type ?? "Directory",
-                } as FileSystem.File.Info),
+            input.worktree?.statFailure !== undefined
+              ? Effect.fail(input.worktree.statFailure)
+              : input.worktree?.type === "missing"
+                ? Effect.fail(
+                    PlatformError.systemError({
+                      _tag: "NotFound",
+                      module: "FileSystem",
+                      method: "stat",
+                    }),
+                  )
+                : Effect.succeed({
+                    type: input.worktree?.type ?? "Directory",
+                  } as FileSystem.File.Info),
         }),
         Layer.mock(GitWorkflow.GitWorkflowService)({ pruneWorktrees, createWorktree }),
         Layer.mock(ProjectService.ProjectService)({
@@ -608,8 +611,22 @@ function makeLocalCommandHarness(input: {
   };
 }
 
+const notDirectoryWorktreeError = PlatformError.systemError({
+  _tag: "BadResource",
+  module: "FileSystem",
+  method: "stat",
+  pathOrDescriptor: "/tmp/native-account-command-worktree",
+  cause: { code: "ENOTDIR" },
+});
+
 effectIt.effect.each([
   { branch: "feature/deleted", type: "missing" as const, projectMissing: false },
+  {
+    branch: "feature/deleted",
+    type: "missing" as const,
+    projectMissing: false,
+    statFailure: notDirectoryWorktreeError,
+  },
   { branch: "feature/deleted", type: "File" as const, projectMissing: false },
   { branch: null, type: "missing" as const, projectMissing: false },
   { branch: "feature/deleted", type: "missing" as const, projectMissing: true },
@@ -644,31 +661,63 @@ effectIt.effect.each([
   }),
 );
 
-effectIt.effect.each(["missing", "Directory"] as const)(
-  "starts the provider when the worktree is available after recovery: %s",
-  (type) =>
-    Effect.gen(function* () {
-      const harness = makeLocalCommandHarness({
-        text: "Continue",
-        failReadsAfterRunning: true,
-        worktree: { branch: "feature/restore", type, repair: "success" },
+effectIt.effect.each([
+  { type: "missing" as const },
+  { type: "missing" as const, statFailure: notDirectoryWorktreeError },
+  { type: "Directory" as const },
+])("starts the provider when the worktree is available after recovery: %j", (worktree) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      failReadsAfterRunning: true,
+      worktree: { ...worktree, branch: "feature/restore", repair: "success" },
+    });
+    yield* harness.start;
+    expect(harness.open).toHaveBeenCalledOnce();
+    expect(harness.startRootRun).toHaveBeenCalledOnce();
+    expect(harness.projection().runs.at(-1)?.status).toBe("running");
+    if (worktree.type === "missing") {
+      expect(harness.pruneWorktrees).toHaveBeenCalledWith({ cwd: "/tmp/native-account-command" });
+      expect(harness.createWorktree).toHaveBeenCalledWith({
+        cwd: "/tmp/native-account-command",
+        refName: "feature/restore",
+        path: "/tmp/native-account-command-worktree",
       });
-      yield* harness.start;
-      expect(harness.open).toHaveBeenCalledOnce();
-      expect(harness.startRootRun).toHaveBeenCalledOnce();
-      expect(harness.projection().runs.at(-1)?.status).toBe("running");
-      if (type === "missing") {
-        expect(harness.pruneWorktrees).toHaveBeenCalledWith({ cwd: "/tmp/native-account-command" });
-        expect(harness.createWorktree).toHaveBeenCalledWith({
-          cwd: "/tmp/native-account-command",
-          refName: "feature/restore",
-          path: "/tmp/native-account-command-worktree",
-        });
-      } else {
-        expect(harness.pruneWorktrees).not.toHaveBeenCalled();
-        expect(harness.createWorktree).not.toHaveBeenCalled();
-      }
-    }),
+    } else {
+      expect(harness.pruneWorktrees).not.toHaveBeenCalled();
+      expect(harness.createWorktree).not.toHaveBeenCalled();
+    }
+  }),
+);
+
+effectIt.effect.each([
+  { tag: "PermissionDenied" as const, code: "EACCES" },
+  { tag: "BadResource" as const, code: "ELOOP" },
+  { tag: "Unknown" as const, code: "EIO" },
+])("propagates unexpected worktree stat errors before provider startup: %j", ({ tag, code }) =>
+  Effect.gen(function* () {
+    const statFailure = PlatformError.systemError({
+      _tag: tag,
+      module: "FileSystem",
+      method: "stat",
+      pathOrDescriptor: "/tmp/native-account-command-worktree",
+      cause: { code },
+    });
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      worktree: { branch: "feature/restore", type: "Directory", repair: "success", statFailure },
+    });
+    const error = yield* harness.startWithRetry.pipe(Effect.flip);
+    expect(error._tag).toBe("ProviderTurnStartError");
+    expect(error.cause).toBe(statFailure);
+    expect(harness.projection().runs.at(-1)).toMatchObject({ status: "starting", startedAt: null });
+    expect(harness.pruneWorktrees).not.toHaveBeenCalled();
+    expect(harness.createWorktree).not.toHaveBeenCalled();
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
+    expect(harness.events).toEqual([]);
+  }),
 );
 
 effectIt.effect("does not terminalize an interrupted worktree repair", () =>

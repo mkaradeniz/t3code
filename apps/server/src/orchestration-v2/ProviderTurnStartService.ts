@@ -465,7 +465,19 @@ export const layer: Layer.Layer<
       if (worktreePath !== null) {
         const isDirectory = yield* fileSystem.stat(worktreePath).pipe(
           Effect.map((stat) => stat.type === "Directory"),
-          Effect.catch((error) => Effect.succeed(error.reason._tag !== "NotFound")),
+          Effect.catchIf(
+            (error) => {
+              const reason = error.reason;
+              return (
+                reason._tag === "NotFound" ||
+                (reason._tag === "BadResource" &&
+                  reason.pathOrDescriptor === worktreePath &&
+                  Predicate.hasProperty(reason.cause, "code") &&
+                  reason.cause.code === "ENOTDIR")
+              );
+            },
+            () => Effect.succeed(false),
+          ),
         );
         if (!isDirectory) {
           const project = yield* projects.getById(projection.thread.projectId).pipe(
